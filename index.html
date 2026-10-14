@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src https://api.github.com; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow">
+<meta name="theme-color" content="#0f9d6b">
+<meta name="color-scheme" content="light dark">
+<title>My Spends</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- First-time setup -->
+<section id="setup" class="screen hidden">
+  <div class="box">
+    <div class="logo">₹</div>
+    <h1>Set up My Spends</h1>
+    <p class="mut">Your data is encrypted on this phone and stored in your private GitHub repo.</p>
+    <label>Data repo (must be private)
+      <input id="s-repo" placeholder="username/money-data" autocapitalize="off" autocomplete="off" spellcheck="false">
+    </label>
+    <label>GitHub token (access to that repo only)
+      <input id="s-token" type="password" placeholder="github_pat_…" autocomplete="off" spellcheck="false">
+    </label>
+    <label>Create a PIN (6+ digits, longer is stronger)
+      <input id="s-pin" type="password" inputmode="numeric" autocomplete="off">
+    </label>
+    <label>Confirm PIN
+      <input id="s-pin2" type="password" inputmode="numeric" autocomplete="off">
+    </label>
+    <button class="btn" id="s-go" data-a="setup">Continue</button>
+    <p id="s-err" class="err"></p>
+    <p class="tiny">If you forget the PIN, the data cannot be recovered. Use Export CSV in Settings for backups.</p>
+  </div>
+</section>
+
+<!-- PIN lock -->
+<section id="lock" class="screen hidden">
+  <div class="box center">
+    <div class="logo">₹</div>
+    <h1>My Spends</h1>
+    <input id="pin" type="password" inputmode="numeric" autocomplete="off" placeholder="Enter PIN" class="pinbox">
+    <button class="btn" id="l-go" data-a="unlock">Unlock</button>
+    <p id="l-err" class="err"></p>
+    <button class="link" data-a="abc">Use letters instead of digits</button>
+  </div>
+</section>
+
+<!-- Main app -->
+<main id="main" class="hidden">
+  <header class="top">
+    <div id="hdr-left"></div>
+    <button class="sync off" id="sync" data-a="sync"><i></i><span>Offline</span></button>
+  </header>
+  <div id="view"></div>
+
+  <button class="fab" data-a="add" aria-label="Add expense">+</button>
+
+  <nav class="tabs">
+    <button data-a="tab" data-v="home">
+      <svg viewBox="0 0 24 24"><path d="M3 11l9-8 9 8v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg><span>Home</span>
+    </button>
+    <button data-a="tab" data-v="history">
+      <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span>History</span>
+    </button>
+    <button data-a="tab" data-v="settings">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg><span>Settings</span>
+    </button>
+  </nav>
+</main>
+
+<!-- Add / edit sheet -->
+<div id="sheet" class="sheet hidden"><div class="panel" id="panel"></div></div>
+<div id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
