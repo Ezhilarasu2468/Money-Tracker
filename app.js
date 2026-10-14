@@ -9,12 +9,17 @@
 
 const $ = (s, r = document) => r.querySelector(s);
 const enc = new TextEncoder(), dec = new TextDecoder();
-const LS = { cfg: 'mt_cfg', tok: 'mt_tok', cache: 'mt_cache' };
+const LS = { cfg: 'mt_cfg', tok: 'mt_tok', cache: 'mt_cache', tr: 'mt_tr' };
 const ITER = 600000, LOCK_MS = 60000;
 const PALETTE = ['#f97316','#3b82f6','#ef4444','#a855f7','#10b981','#ec4899','#eab308','#64748b','#14b8a6','#8b5cf6'];
-const DEFAULT_CATS = [['Food','🍽️'],['Groceries','🛒'],['Travel','🚗'],['Bills','🧾'],
-  ['Shopping','🛍️'],['Health','💊'],['Entertainment','🎬'],['Other','📦']]
-  .map(([n, e], i) => ({ n, e, c: PALETTE[i] }));
+const DEFAULT_CATS = [['Breakfast','🍳','#eab308'],['Lunch','🍛','#f97316'],['Dinner','🍲','#6366f1'],['Snacks & Tea','☕','#a16207'],
+  ['Groceries','🛒','#10b981'],['Travel','🚌','#3b82f6'],['Bills','🧾','#64748b'],['Shopping','🛍️','#ec4899'],
+  ['Health','💊','#ef4444'],['Entertainment','🎬','#a855f7'],['Other','📦','#14b8a6']]
+  .map(([n, e, c]) => ({ n, e, c }));
+const LEGACY = { Food: { e: '🍽️', c: '#f97316' } };   // old category kept readable
+const SV = 2;                                           // settings version (bump when default categories change)
+const TRANSPORT = [['Bus','🚌'],['Auto','🛺'],['Train','🚆'],['Metro','🚇'],['Cab','🚕'],['Bike','🏍️'],['Walk','🚶']];
+const trIcon = n => (TRANSPORT.find(t => t[0] === n) || [])[1];
 const MODES = ['UPI', 'Cash', 'Card', 'Other'];
 
 /* ---------- helpers ---------- */
@@ -53,7 +58,7 @@ async function unseal(key, text) {
 }
 
 /* ---------- state ---------- */
-const newDb = () => ({ months: {}, settings: { cats: DEFAULT_CATS.map(c => ({ ...c })), budget: 0, u: 0 },
+const newDb = () => ({ months: {}, settings: { cats: DEFAULT_CATS.map(c => ({ ...c })), budget: 0, u: 0, v: SV },
   dirty: [], sdirty: false, ssha: null, last: 0, rev: 0 });
 const S = { cfg: null, key: null, token: null, db: null, syncing: false, hiddenAt: 0,
   ui: { tab: 'home', month: curMonth(), q: '', cat: '', all: false } };
@@ -62,7 +67,24 @@ let F = null; // add/edit form state
 const monthItems = m => (S.db.months[m]?.items || []).filter(x => !x.d);
 const allItems = () => Object.values(S.db.months).flatMap(mo => mo.items).filter(x => !x.d);
 const findItem = id => { for (const mo of Object.values(S.db.months)) { const x = mo.items.find(i => i.id === id && !i.d); if (x) return x; } return null; };
-const catInfo = n => S.db.settings.cats.find(c => c.n === n) || { n, e: '📦', c: '#64748b' };
+const catInfo = n => S.db.settings.cats.find(c => c.n === n) || { n, ...(LEGACY[n] || { e: '📦', c: '#64748b' }) };
+
+// one-time upgrade of saved categories: Food -> Breakfast/Lunch/Dinner/Snacks, Travel icon -> bus
+function migrateSettings() {
+  const s = S.db.settings;
+  if ((s.v || 0) >= SV) return;
+  const meals = DEFAULT_CATS.slice(0, 4).filter(d => !s.cats.some(c => c.n === d.n)).map(c => ({ ...c }));
+  s.cats = [...meals, ...s.cats.filter(c => c.n !== 'Food')];
+  const t = s.cats.find(c => c.n === 'Travel'); if (t) t.e = '🚌';
+  s.v = SV; touchSettings();
+}
+// pre-select the meal that fits the time of day
+function defaultCat() {
+  const h = new Date().getHours(), cats = S.db.settings.cats;
+  const want = h >= 5 && h < 11 ? 'Breakfast' : h >= 11 && h < 16 ? 'Lunch' : h >= 16 && h < 19 ? 'Snacks & Tea' : h >= 19 && h < 23 ? 'Dinner' : null;
+  return cats.find(c => c.n === want)?.n || cats[0]?.n || 'Other';
+}
+function lastTr() { try { return localStorage.getItem(LS.tr) || 'Bus'; } catch { return 'Bus'; } }
 
 function upsert(it) {
   const m = it.ts.slice(0, 7);
@@ -154,7 +176,7 @@ async function syncSettings() {
     if (r) { sha = r.sha; remote = await unseal(S.key, r.text); }
     const local = S.db.settings;
     if (remote && (remote.u || 0) > (local.u || 0)) {
-      S.db.settings = { cats: remote.cats, budget: remote.budget, u: remote.u };
+      S.db.settings = { cats: remote.cats, budget: remote.budget, u: remote.u, v: remote.v };
       S.db.sdirty = false; S.db.ssha = sha; return true;
     }
     S.db.ssha = sha;
@@ -287,6 +309,8 @@ async function lock() {
 
 /* ---------- rendering ---------- */
 function render() {
+  migrateSettings();
+  $('#view').dataset.tab = S.ui.tab;
   renderHeader();
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.v === S.ui.tab));
   ({ home: renderHome, history: renderHistory, settings: renderSettings })[S.ui.tab]();
@@ -303,9 +327,10 @@ function renderHeader() {
 
 function rowHtml(x) {
   const c = catInfo(x.cat);
+  const ti = x.cat === 'Travel' && x.tr ? trIcon(x.tr) : null;
   return `<button class="item" data-a="edit" data-v="${esc(x.id)}">
-    <span class="ico" style="background:${esc(c.c)}26">${esc(c.e)}</span>
-    <span class="mid"><b>${esc(x.note || x.cat)}</b><small>${esc(x.cat)} · ${timeOf(x.ts)}${x.m ? ' · ' + esc(x.m) : ''}</small></span>
+    <span class="ico" style="background:${esc(c.c)}26">${esc(ti || c.e)}</span>
+    <span class="mid"><b>${esc(x.note || x.tr || x.cat)}</b><small>${esc(x.tr ? x.cat + ' · ' + x.tr : x.cat)} · ${timeOf(x.ts)}${x.m ? ' · ' + esc(x.m) : ''}</small></span>
     <span class="amt">${fmt(x.amt)}</span></button>`;
 }
 
@@ -350,7 +375,7 @@ function renderHome() {
     <div class="card"><h3>Daily spending</h3>
       <svg class="bars" viewBox="0 0 ${days * 10} 90"><line class="base" x1="0" x2="${days * 10}" y1="70" y2="70"/>${bars}${ticks}</svg>
       <div class="sub mut"><span>Highest: ${fmt(perDay[hi])} on ${hi + 1} ${esc(new Date(m + '-01').toLocaleDateString('en-IN', { month: 'short' }))}</span></div></div>
-    <div class="card"><div class="secthead"><h3>Recent</h3><button class="link" data-a="tab" data-v="history">See all</button></div>${recent}</div>`;
+    <div class="card wide"><div class="secthead"><h3>Recent</h3><button class="link" data-a="tab" data-v="history">See all</button></div>${recent}</div>`;
 }
 
 function histItems() {
@@ -400,7 +425,7 @@ function renderSettings() {
 /* ---------- add / edit sheet ---------- */
 function openSheet(id) {
   const it = id ? findItem(id) : null;
-  F = it ? { ...it } : { id: null, amt: '', cat: S.db.settings.cats[0]?.n || 'Other', note: '', ts: nowLocal(), m: 'UPI' };
+  F = it ? { ...it } : { id: null, amt: '', cat: defaultCat(), note: '', ts: nowLocal(), m: 'UPI', tr: lastTr() };
   const cats = S.db.settings.cats.slice();
   if (!cats.find(c => c.n === F.cat)) cats.push(catInfo(F.cat));
   $('#panel').innerHTML = `<div class="grab"></div>
@@ -408,6 +433,8 @@ function openSheet(id) {
     <div class="amtbox"><span>₹</span><input id="f-amt" inputmode="decimal" placeholder="0" autocomplete="off" value="${F.amt}"></div>
     <div class="fl">Area</div>
     <div class="chips" id="f-cats">${cats.map(c => `<button class="chip ${c.n === F.cat ? 'on' : ''}" data-a="pick-cat" data-v="${esc(c.n)}">${esc(c.e)} ${esc(c.n)}</button>`).join('')}</div>
+    <div id="f-trw" class="${F.cat === 'Travel' ? '' : 'hidden'}"><div class="fl">Transport</div>
+      <div class="chips" id="f-tr">${TRANSPORT.map(([n, e]) => `<button class="chip ${n === F.tr ? 'on' : ''}" data-a="pick-tr" data-v="${n}">${e} ${n}</button>`).join('')}</div></div>
     <div class="fl">Purpose</div><input id="f-note" maxlength="80" placeholder="e.g. Lunch with team" autocomplete="off" value="${esc(F.note)}">
     <div class="fl">Date & time</div><input id="f-ts" type="datetime-local" value="${esc(F.ts)}">
     <div class="fl">Paid via</div>
@@ -424,11 +451,12 @@ function saveForm() {
   if (!(amt > 0) || amt > 1e9) return toast('Enter an amount');
   const ts = $('#f-ts').value;
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(ts)) return toast('Pick a date and time');
-  const item = { id: F.id || uid(), amt, cat: F.cat, note: $('#f-note').value.trim(), ts: ts.slice(0, 16), m: F.m, u: Date.now() };
+  const item = { id: F.id || uid(), amt, cat: F.cat, note: $('#f-note').value.trim(), ts: ts.slice(0, 16), m: F.m, ...(F.cat === 'Travel' && F.tr ? { tr: F.tr } : {}), u: Date.now() };
   if (F.id) {
     const old = findItem(F.id);
     if (old && old.ts.slice(0, 7) !== item.ts.slice(0, 7)) { tombstone(old); item.id = uid(); } // moved to another month
   }
+  if (item.tr) { try { localStorage.setItem(LS.tr, item.tr); } catch {} }
   upsert(item);
   closeSheet(); render(); persist(); scheduleSync();
   toast(`Saved ${fmt(amt)} · ${item.cat}`);
@@ -446,8 +474,8 @@ function touchSettings() { const s = S.db.settings; s.u = Date.now(); S.db.sdirt
 function exportCsv() {
   const cell = v => { let s = String(v ?? ''); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return `"${s.replace(/"/g, '""')}"`; };
   const rows = allItems().sort((a, b) => a.ts.localeCompare(b.ts))
-    .map(x => [x.ts.slice(0, 10), x.ts.slice(11, 16), x.amt, x.cat, x.note, x.m].map(cell).join(','));
-  const blob = new Blob(['\ufeff' + ['Date,Time,Amount,Area,Purpose,Paid via', ...rows].join('\n')], { type: 'text/csv' });
+    .map(x => [x.ts.slice(0, 10), x.ts.slice(11, 16), x.amt, x.cat, x.tr, x.note, x.m].map(cell).join(','));
+  const blob = new Blob(['\ufeff' + ['Date,Time,Amount,Area,Transport,Purpose,Paid via', ...rows].join('\n')], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = `expenses-${nowLocal().slice(0, 10)}.csv`;
   document.body.appendChild(a); a.click(); a.remove();
@@ -465,8 +493,9 @@ const actions = {
   close: closeSheet,
   edit(id) { openSheet(id); },
   save: saveForm, del: deleteForm,
-  'pick-cat'(v, el) { F.cat = v; el.parentNode.querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c === el)); },
+  'pick-cat'(v, el) { F.cat = v; $('#f-trw').classList.toggle('hidden', v !== 'Travel'); el.parentNode.querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c === el)); },
   'pick-mode'(v, el) { F.m = v; el.parentNode.querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c === el)); },
+  'pick-tr'(v, el) { F.tr = v; el.parentNode.querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c === el)); },
   mprev() { S.ui.month = shiftMonth(S.ui.month, -1); render(); },
   mnext() { if (S.ui.month < curMonth()) { S.ui.month = shiftMonth(S.ui.month, 1); render(); } },
   mnow() { S.ui.month = curMonth(); render(); },
@@ -515,9 +544,11 @@ document.addEventListener('change', e => {
   }
 });
 document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && F) return closeSheet();
   if (e.key !== 'Enter') return;
   if (e.target.id === 'pin') unlock();
   else if (e.target.id === 's-pin2') setup();
+  else if (F && (e.target.id === 'f-amt' || e.target.id === 'f-note')) saveForm();
 });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { S.hiddenAt = Date.now(); persist(true); }
