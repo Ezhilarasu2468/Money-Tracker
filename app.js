@@ -12,12 +12,12 @@ const enc = new TextEncoder(), dec = new TextDecoder();
 const LS = { cfg: 'mt_cfg', tok: 'mt_tok', cache: 'mt_cache', tr: 'mt_tr' };
 const ITER = 600000, LOCK_MS = 60000;
 const PALETTE = ['#f97316','#3b82f6','#ef4444','#a855f7','#10b981','#ec4899','#eab308','#64748b','#14b8a6','#8b5cf6'];
-const DEFAULT_CATS = [['Breakfast','🍳','#eab308'],['Lunch','🍛','#f97316'],['Dinner','🍲','#6366f1'],['Snacks & Tea','☕','#a16207'],
-  ['Groceries','🛒','#10b981'],['Travel','🚌','#3b82f6'],['Bills','🧾','#64748b'],['Shopping','🛍️','#ec4899'],
-  ['Health','💊','#ef4444'],['Entertainment','🎬','#a855f7'],['Other','📦','#14b8a6']]
+const DEFAULT_CATS = [['Breakfast','🍳','#f2b632'],['Lunch','🍛','#ff7a1a'],['Dinner','🍲','#e11d2a'],['Snacks & Tea','☕','#a86b2d'],
+  ['Groceries','🛒','#7fb069'],['Travel','🚌','#4aa3ff'],['Bills','🧾','#9aa0a6'],['Shopping','🛍️','#ff5d8f'],
+  ['Health','💊','#2ec4b6'],['Entertainment','🎬','#b388ff'],['Other','📦','#d9cbb8']]
   .map(([n, e, c]) => ({ n, e, c }));
 const LEGACY = { Food: { e: '🍽️', c: '#f97316' } };   // old category kept readable
-const SV = 2;                                           // settings version (bump when default categories change)
+const SV = 3;                                           // settings version (bump when default categories change)
 const TRANSPORT = [['Bus','🚌'],['Auto','🛺'],['Train','🚆'],['Metro','🚇'],['Cab','🚕'],['Bike','🏍️'],['Walk','🚶']];
 const trIcon = n => (TRANSPORT.find(t => t[0] === n) || [])[1];
 const MODES = ['UPI', 'Cash', 'Card', 'Other'];
@@ -59,10 +59,11 @@ async function unseal(key, text) {
 
 /* ---------- state ---------- */
 const newDb = () => ({ months: {}, settings: { cats: DEFAULT_CATS.map(c => ({ ...c })), budget: 0, u: 0, v: SV },
-  dirty: [], sdirty: false, ssha: null, last: 0, rev: 0 });
+  dirty: [], sdirty: false, ssha: null, last: 0, rev: 0, loans: { items: [], sha: null }, ldirty: false, lrev: 0 });
 const S = { cfg: null, key: null, token: null, db: null, syncing: false, hiddenAt: 0,
   ui: { tab: 'home', month: curMonth(), q: '', cat: '', all: false } };
 let F = null; // add/edit form state
+let L = null; // lending form state
 
 const monthItems = m => (S.db.months[m]?.items || []).filter(x => !x.d);
 const allItems = () => Object.values(S.db.months).flatMap(mo => mo.items).filter(x => !x.d);
@@ -71,11 +72,17 @@ const catInfo = n => S.db.settings.cats.find(c => c.n === n) || { n, ...(LEGACY[
 
 // one-time upgrade of saved categories: Food -> Breakfast/Lunch/Dinner/Snacks, Travel icon -> bus
 function migrateSettings() {
-  const s = S.db.settings;
-  if ((s.v || 0) >= SV) return;
-  const meals = DEFAULT_CATS.slice(0, 4).filter(d => !s.cats.some(c => c.n === d.n)).map(c => ({ ...c }));
-  s.cats = [...meals, ...s.cats.filter(c => c.n !== 'Food')];
-  const t = s.cats.find(c => c.n === 'Travel'); if (t) t.e = '🚌';
+  const s = S.db.settings, v = s.v || 0;
+  if (v >= SV) return;
+  if (v < 2) {
+    const meals = DEFAULT_CATS.slice(0, 4).filter(d => !s.cats.some(c => c.n === d.n)).map(c => ({ ...c }));
+    s.cats = [...meals, ...s.cats.filter(c => c.n !== 'Food')];
+    const t = s.cats.find(c => c.n === 'Travel'); if (t) t.e = '🚌';
+  }
+  if (v < 3) {   // red/black/gold theme: recolor the default categories
+    const col = Object.fromEntries(DEFAULT_CATS.map(d => [d.n, d.c]));
+    s.cats.forEach(c => { if (col[c.n]) c.c = col[c.n]; });
+  }
   s.v = SV; touchSettings();
 }
 // pre-select the meal that fits the time of day
@@ -188,6 +195,229 @@ async function syncSettings() {
   throw new ApiErr(409, 'Too many conflicts');
 }
 
+/* ---------- lending (money lent to friends) ---------- */
+// Every entry is one record: { id, k:'lend'|'repay', who, amt, ts, note, u, d? }.
+// A friend's balance = sum(lend) - sum(repay), so two devices can never overwrite each other's repayments.
+const pkey = n => String(n).trim().toLowerCase().replace(/\s+/g, ' ');
+const loanItems = () => S.db.loans.items.filter(x => !x.d);
+const findLoan = id => S.db.loans.items.find(x => x.id === id && !x.d) || null;
+function upsertLoan(it) {
+  const a = S.db.loans.items, i = a.findIndex(x => x.id === it.id);
+  if (i >= 0) a[i] = it; else a.push(it);
+  S.db.ldirty = true; S.db.lrev++;
+}
+const daysAgo = ts => Math.max(0, Math.floor((Date.now() - new Date(ts).getTime()) / 864e5));
+const shortDate = ts => new Date(ts).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+const longDate = ts => new Date(ts).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) + ', ' + timeOf(ts);
+
+function people() {
+  const m = new Map();
+  for (const x of loanItems()) {
+    const k = pkey(x.who);
+    let p = m.get(k);
+    if (!p) m.set(k, p = { key: k, name: x.who.trim(), lent: 0, rep: 0, items: [], first: x.ts, last: x.ts });
+    p.items.push(x);
+    if (x.k === 'repay') p.rep += x.amt; else p.lent += x.amt;
+    if (x.ts < p.first) p.first = x.ts;
+    if (x.ts > p.last) p.last = x.ts;
+  }
+  const out = [...m.values()];
+  out.forEach(p => {
+    p.lent = Math.round(p.lent * 100) / 100; p.rep = Math.round(p.rep * 100) / 100;
+    p.bal = Math.round((p.lent - p.rep) * 100) / 100;
+    p.items.sort((a, b) => b.ts.localeCompare(a.ts));
+  });
+  return out;
+}
+
+function lentCardHtml() {
+  const ps = people().filter(p => p.bal > 0.004);
+  if (!ps.length) return '';
+  const t = ps.reduce((s, p) => s + p.bal, 0);
+  return `<button class="card wide lentcard" data-a="tab" data-v="lent"><span><small>Lent out · to get back</small><b>${fmt(t)}</b></span><span class="mut">${ps.length} ${ps.length === 1 ? 'person' : 'people'} ›</span></button>`;
+}
+
+function personRow(p) {
+  const pending = p.bal > 0.004, adv = p.bal < -0.004;
+  const pct = p.lent ? Math.min(100, p.rep / p.lent * 100) : 0, age = daysAgo(p.first);
+  const meta = pending
+    ? 'Lent ' + fmt(p.lent) + ' · Repaid ' + fmt(p.rep) + ' · since ' + shortDate(p.first) + (age >= 30 ? ' · ' + age + ' days' : '')
+    : 'Fully repaid · ' + shortDate(p.last);
+  return `<button class="person" data-a="person" data-v="${esc(p.key)}">
+    <span class="av">${esc(p.name.charAt(0).toUpperCase())}</span>
+    <span class="mid"><b>${esc(p.name)}</b><small>${esc(meta)}</small><span class="pbar"><b style="width:${pct}%"></b></span></span>
+    <span class="due ${pending ? '' : 'ok'}"><b>${pending ? fmt(p.bal) : adv ? fmt(-p.bal) : '✓'}</b><small>${pending ? 'to get back' : adv ? 'extra paid' : 'settled'}</small></span></button>`;
+}
+
+function renderLent() {
+  const ps = people();
+  const owing = ps.filter(p => p.bal > 0.004).sort((a, b) => b.bal - a.bal);
+  const done = ps.filter(p => p.bal <= 0.004).sort((a, b) => b.last.localeCompare(a.last));
+  const all = loanItems();
+  const lent = sum(all.filter(x => x.k !== 'repay')), got = sum(all.filter(x => x.k === 'repay'));
+  const toGet = owing.reduce((s, p) => s + p.bal, 0);
+  const pct = lent ? Math.min(100, got / lent * 100) : 0;
+  if (!ps.length) {
+    $('#view').innerHTML = `<div class="card hero"><div class="lbl">To get back</div><div class="big">${fmt(0)}</div></div>
+      <div class="card empty">Nobody owes you anything yet.<br>Tap <b>+</b> when you lend money to a friend.</div>`;
+    return;
+  }
+  let h = `<div class="card hero"><div class="lbl">To get back</div><div class="big">${fmt(toGet)}</div>
+    <div class="sub"><span>${owing.length} ${owing.length === 1 ? 'person' : 'people'} pending</span><span>Lent in total ${fmt(lent)}</span></div>
+    <div class="bud"><div class="bar"><b style="width:${pct}%"></b></div>
+    <div class="sub"><span>Received back ${fmt(got)}</span><span>${Math.round(pct)}%</span></div></div></div>`;
+  h += owing.length
+    ? `<div class="card wide"><h3>Pending (${owing.length})</h3>${owing.map(personRow).join('')}</div>`
+    : `<div class="card empty wide">🎉 Everyone has paid you back.</div>`;
+  if (done.length) {
+    const open = !!S.ui.settled;
+    h += `<div class="card wide"><button class="secthead rowbtn" data-a="show-settled"><h3>Settled (${done.length})</h3><span class="mut">${open ? 'Hide' : 'Show'}</span></button>${open ? done.map(personRow).join('') : ''}</div>`;
+  }
+  $('#view').innerHTML = h;
+}
+
+function entryRow(x) {
+  const rep = x.k === 'repay';
+  return `<button class="item" data-a="loan-edit" data-v="${esc(x.id)}">
+    <span class="ico" style="background:${rep ? '#f2b63226' : '#e11d2a2e'};color:${rep ? 'var(--gold)' : '#ff6b6b'}">${rep ? '↙' : '↗'}</span>
+    <span class="mid"><b>${rep ? 'Repaid' : 'Lent'}${x.note ? ' · ' + esc(x.note) : ''}</b><small>${esc(longDate(x.ts))}</small></span>
+    <span class="amt ${rep ? 'in' : 'out'}">${rep ? '−' : '+'}${fmt(x.amt)}</span></button>`;
+}
+
+function openPerson(key) {
+  const p = people().find(x => x.key === key);
+  if (!p) { closeSheet(); return; }
+  F = null; L = null;
+  const pending = p.bal > 0.004, adv = p.bal < -0.004;
+  const pct = p.lent ? Math.min(100, p.rep / p.lent * 100) : 0;
+  $('#panel').innerHTML = `<div class="grab"></div>
+    <div class="sh-head"><h2>${esc(p.name)}</h2><button class="x" data-a="close" aria-label="Close">✕</button></div>
+    <div class="ph"><div class="lbl">${pending ? 'Owes you' : adv ? 'Paid extra' : 'All settled 🎉'}</div>
+      <div class="big">${fmt(Math.abs(p.bal))}</div>
+      <div class="pbar big"><b style="width:${pct}%"></b></div>
+      <div class="sub mut"><span>Lent ${fmt(p.lent)}</span><span>Repaid ${fmt(p.rep)}</span></div></div>
+    <div class="acts"><button class="btn" data-a="lend-more" data-v="${esc(p.key)}">Lend more</button>
+      <button class="btn gold" data-a="got-back" data-v="${esc(p.key)}">Got repayment</button></div>
+    ${pending ? `<button class="btn ghost" data-a="settle" data-v="${esc(p.key)}">Mark fully repaid (${fmt(p.bal)})</button>
+      <button class="btn ghost" data-a="remind" data-v="${esc(p.key)}">Remind on WhatsApp</button>` : ''}
+    <div class="fl">History · tap an entry to edit</div>
+    <div class="card" style="padding:4px 14px">${p.items.map(entryRow).join('')}</div>`;
+  $('#sheet').classList.remove('hidden');
+}
+
+const loanTitle = () => L.id ? 'Edit entry' : L.k === 'repay' ? 'Repayment received' : 'Lend money';
+
+function openLoanSheet(o = {}) {
+  const it = o.id ? findLoan(o.id) : null;
+  F = null;
+  L = it ? { ...it, back: !!o.back } : { id: null, k: o.kind || 'lend', who: o.who || '', amt: '', ts: nowLocal(), note: '', back: !!o.back };
+  const names = people().map(p => p.name);
+  $('#panel').innerHTML = `<div class="grab"></div>
+    <div class="sh-head"><h2 id="l-title">${loanTitle()}</h2><button class="x" data-a="close" aria-label="Close">✕</button></div>
+    <div class="seg"><button class="${L.k === 'lend' ? 'on' : ''}" data-a="lk" data-v="lend">I lent</button><button class="${L.k === 'repay' ? 'on' : ''}" data-a="lk" data-v="repay" data-r="1">They repaid</button></div>
+    <div class="fl">Friend</div>
+    <input id="l-who" maxlength="40" placeholder="Name, e.g. Abbas" autocomplete="off" value="${esc(L.who)}">
+    ${names.length ? `<div class="chips" style="margin-top:8px">${names.map(n => `<button class="chip" data-a="lpick" data-v="${esc(n)}">${esc(n)}</button>`).join('')}</div>` : ''}
+    <div class="fl">Amount</div>
+    <div class="amtbox" style="margin-top:0"><span>₹</span><input id="l-amt" inputmode="decimal" placeholder="0" autocomplete="off" value="${L.amt}"></div>
+    <div class="chips"><button id="l-full" class="chip hidden" data-a="lfull"></button></div>
+    <div class="fl">Date & time</div><input id="l-ts" type="datetime-local" value="${esc(L.ts)}">
+    <div class="fl">Note (optional)</div><input id="l-note" maxlength="80" placeholder="e.g. for movie tickets" autocomplete="off" value="${esc(L.note || '')}">
+    <button class="btn big" data-a="loan-save">Save</button>
+    ${it ? '<button class="btn ghost danger" data-a="loan-del">Delete entry</button>' : ''}`;
+  $('#sheet').classList.remove('hidden');
+  refreshFull();
+  if (!it) setTimeout(() => { const e = $(L && L.who ? '#l-amt' : '#l-who'); if (e) e.focus(); }, 120);
+}
+
+// "Full ₹X" shortcut when recording a repayment for someone who owes money
+function refreshFull() {
+  const b = $('#l-full'); if (!b || !L) return;
+  const p = people().find(x => x.key === pkey($('#l-who').value || ''));
+  if (!L.id && L.k === 'repay' && p && p.bal > 0.004) { b.textContent = 'Full ' + fmt(p.bal); b.dataset.v = String(p.bal); b.classList.remove('hidden'); }
+  else b.classList.add('hidden');
+}
+
+function saveLoan() {
+  const who = $('#l-who').value.trim();
+  const amt = Math.round(parseFloat($('#l-amt').value) * 100) / 100;
+  const ts = $('#l-ts').value;
+  if (!who) return toast("Enter your friend's name");
+  if (!(amt > 0) || amt > 1e9) return toast('Enter an amount');
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(ts)) return toast('Pick a date and time');
+  const ex = people().find(p => p.key === pkey(who));
+  if (L.k === 'repay' && ex) {
+    const other = ex.items.filter(x => x.id !== L.id);
+    const pend = sum(other.filter(x => x.k !== 'repay')) - sum(other.filter(x => x.k === 'repay'));
+    if (amt > pend + 0.004 && !confirm(ex.name + ' only owes ' + fmt(Math.max(pend, 0)) + '. Save this repayment anyway?')) return;
+  }
+  const name = ex ? ex.name : who;
+  const item = { id: L.id || uid(), k: L.k, who: name, amt, ts: ts.slice(0, 16), note: $('#l-note').value.trim(), u: Date.now() };
+  const back = L.back;
+  upsertLoan(item);
+  closeSheet(); render(); persist(); scheduleSync();
+  toast((item.k === 'repay' ? 'Received ' : 'Lent ') + fmt(amt) + ' · ' + name);
+  if (back) openPerson(pkey(name));
+}
+
+function deleteLoan() {
+  if (!L || !L.id || !confirm('Delete this entry?')) return;
+  const old = findLoan(L.id), back = L.back;
+  if (old) upsertLoan({ id: old.id, k: old.k, who: old.who, ts: old.ts, d: 1, u: Date.now() });
+  closeSheet(); render(); persist(); scheduleSync(); toast('Deleted');
+  if (back && old) openPerson(pkey(old.who));
+}
+
+function settleLoan(key) {
+  const p = people().find(x => x.key === key);
+  if (!p || p.bal <= 0.004) return;
+  if (!confirm('Mark ' + fmt(p.bal) + ' from ' + p.name + ' as fully repaid?')) return;
+  upsertLoan({ id: uid(), k: 'repay', who: p.name, amt: p.bal, ts: nowLocal(), note: 'Settled', u: Date.now() });
+  render(); persist(); scheduleSync(); openPerson(key); toast('Marked as settled');
+}
+
+function remindLoan(key) {
+  const p = people().find(x => x.key === key);
+  if (!p || p.bal <= 0.004) return;
+  const text = 'Hi ' + p.name + ', a gentle reminder: ' + fmt(p.bal) + ' is pending that I lent you. Please return it when you can. Thanks!';
+  window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank', 'noopener');
+}
+
+function exportLoans() {
+  const cell = v => { let s = String(v ?? ''); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return '"' + s.replace(/"/g, '""') + '"'; };
+  const rows = loanItems().sort((a, b) => a.ts.localeCompare(b.ts))
+    .map(x => [x.ts.slice(0, 10), x.ts.slice(11, 16), x.k === 'repay' ? 'Repaid' : 'Lent', x.who, x.amt, x.note].map(cell).join(','));
+  const blob = new Blob(['﻿' + ['Date,Time,Type,Friend,Amount,Note', ...rows].join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'lending-' + nowLocal().slice(0, 10) + '.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  toast('Exported ' + rows.length + ' entries');
+}
+
+async function syncLoans() {
+  let changed = false;
+  for (let t = 0; t < 3; t++) {
+    const r = await ghGet('data/loans.enc');
+    let remote = [], sha = null;
+    if (r) { sha = r.sha; remote = (await unseal(S.key, r.text)).items || []; }
+    const local = S.db.loans.items, before = JSON.stringify(local);
+    const merged = mergeItems(local, remote);
+    if (JSON.stringify(merged) !== before) changed = true;
+    S.db.loans = { items: merged, sha };
+    const rev = S.db.lrev;
+    if (!merged.length || (r && sameSet(merged, remote))) { S.db.ldirty = false; return changed; }
+    const res = await ghPut('data/loans.enc', await seal(S.key, { v: 1, items: merged }), sha);
+    if (res.ok) {
+      S.db.loans.sha = res.sha;
+      if (S.db.lrev === rev) S.db.ldirty = false;
+      return changed;
+    }
+    if (res.status !== 409 && res.status !== 422) throw new ApiErr(res.status);
+  }
+  throw new ApiErr(409, 'Too many conflicts');
+}
+
 function setSync(cls, text) { const b = $('#sync'); b.className = 'sync ' + cls; $('span', b).textContent = text; }
 let st;
 const scheduleSync = () => { clearTimeout(st); st = setTimeout(sync, 1200); };
@@ -199,15 +429,16 @@ async function sync() {
   let ok = false, changed = false;
   try {
     const list = await ghList();
-    const rem = {}; let ssha = null;
+    const rem = {}; let ssha = null, lsha = null;
     for (const f of list) {
       const mm = /^(\d{4}-\d{2})\.enc$/.exec(f.name);
-      if (mm) rem[mm[1]] = f.sha; else if (f.name === 'settings.enc') ssha = f.sha;
+      if (mm) rem[mm[1]] = f.sha; else if (f.name === 'settings.enc') ssha = f.sha; else if (f.name === 'loans.enc') lsha = f.sha;
     }
     const months = new Set(S.db.dirty);
     for (const m in rem) if (!S.db.months[m] || S.db.months[m].sha !== rem[m]) months.add(m);
     for (const m of months) { if (!S.key) return; if (await syncMonth(m)) changed = true; }
     if (S.db.sdirty || ssha !== S.db.ssha) { if (await syncSettings()) changed = true; }
+    if (S.db.ldirty || lsha !== S.db.loans.sha) { if (await syncLoans()) changed = true; }
     S.db.last = Date.now(); ok = true;
     persist(); setSync('ok', 'Synced');
     if (changed) render();
@@ -313,12 +544,13 @@ function render() {
   $('#view').dataset.tab = S.ui.tab;
   renderHeader();
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.v === S.ui.tab));
-  ({ home: renderHome, history: renderHistory, settings: renderSettings })[S.ui.tab]();
+  ({ home: renderHome, history: renderHistory, lent: renderLent, settings: renderSettings })[S.ui.tab]();
 }
 
 function renderHeader() {
   const l = $('#hdr-left'), m = S.ui.month;
-  if (S.ui.tab === 'settings') l.innerHTML = '<h1>Settings</h1>';
+  if (S.ui.tab === 'lent') l.innerHTML = '<h1>Money lent</h1>';
+  else if (S.ui.tab === 'settings') l.innerHTML = '<h1>Settings</h1>';
   else if (S.ui.tab === 'history' && S.ui.all) l.innerHTML = '<h1>All expenses</h1>';
   else l.innerHTML = `<button class="nav" data-a="mprev" aria-label="Previous month">‹</button>
     <button class="mlabel" data-a="mnow">${esc(monthLabel(m))}</button>
@@ -349,7 +581,7 @@ function renderHome() {
     hero += `<div class="bud ${total > bud ? 'over' : pct > 80 ? 'warn' : ''}"><div class="bar"><b style="width:${pct}%"></b></div>
       <div class="sub"><span>Budget ${fmt(bud)}</span><span>${left >= 0 ? fmt(left) + ' left' : fmt(-left) + ' over'}</span></div></div>`;
   }
-  hero += '</div>';
+  hero += '</div>' + lentCardHtml();
 
   if (!items.length) {
     $('#view').innerHTML = hero + '<div class="card empty">No expenses this month.<br>Tap <b>+</b> to add one.</div>';
@@ -415,7 +647,8 @@ function renderSettings() {
       <div class="row addcat"><input id="nc-e" class="emo" maxlength="4" placeholder="🙂"><input id="nc-n" maxlength="24" placeholder="New category"><button class="btn sm" data-a="add-cat">Add</button></div></div>
     <div class="card"><h3>Data & security</h3><div class="stack">
       <button class="btn ghost" style="margin:0" data-a="sync">Sync now</button>
-      <button class="btn ghost" style="margin:0" data-a="export">Export all as CSV</button>
+      <button class="btn ghost" style="margin:0" data-a="export">Export expenses as CSV</button>
+      <button class="btn ghost" style="margin:0" data-a="export-loans">Export lending as CSV</button>
       <button class="btn ghost" style="margin:0" data-a="token">Update GitHub token</button>
       <button class="btn ghost" style="margin:0" data-a="lock-now">Lock now</button>
       <button class="btn ghost danger" style="margin:0" data-a="forget">Forget this device</button></div>
@@ -444,7 +677,7 @@ function openSheet(id) {
   $('#sheet').classList.remove('hidden');
   if (!it) setTimeout(() => $('#f-amt').focus(), 120);
 }
-const closeSheet = () => { $('#sheet').classList.add('hidden'); F = null; };
+const closeSheet = () => { $('#sheet').classList.add('hidden'); F = null; L = null; };
 
 function saveForm() {
   const amt = Math.round(parseFloat($('#f-amt').value) * 100) / 100;
@@ -489,7 +722,7 @@ const actions = {
   abc() { const p = $('#pin'); p.inputMode = p.inputMode === 'numeric' ? 'text' : 'numeric'; p.blur(); p.focus(); },
   sync() { clearTimeout(st); sync(); },
   tab(v) { S.ui.tab = v; S.ui.q = ''; S.ui.cat = ''; S.ui.all = false; render(); window.scrollTo(0, 0); },
-  add() { openSheet(); },
+  add() { S.ui.tab === 'lent' ? openLoanSheet({ kind: 'lend' }) : openSheet(); },
   close: closeSheet,
   edit(id) { openSheet(id); },
   save: saveForm, del: deleteForm,
@@ -513,6 +746,23 @@ const actions = {
     S.db.settings.cats = S.db.settings.cats.filter(c => c.n !== v);
     touchSettings(); renderSettings();
   },
+  person(v) { openPerson(v); },
+  'lend-more'(v) { const p = people().find(x => x.key === v); openLoanSheet({ kind: 'lend', who: p ? p.name : '', back: true }); },
+  'got-back'(v) { const p = people().find(x => x.key === v); openLoanSheet({ kind: 'repay', who: p ? p.name : '', back: true }); },
+  settle: settleLoan,
+  remind: remindLoan,
+  'loan-edit'(v) { openLoanSheet({ id: v, back: true }); },
+  lk(v, el) {
+    L.k = v;
+    el.parentNode.querySelectorAll('button').forEach(b => b.classList.toggle('on', b === el));
+    $('#l-title').textContent = loanTitle(); refreshFull();
+  },
+  lpick(v) { $('#l-who').value = v; refreshFull(); },
+  lfull(v) { $('#l-amt').value = v; },
+  'loan-save': saveLoan,
+  'loan-del': deleteLoan,
+  'show-settled'() { S.ui.settled = !S.ui.settled; renderLent(); },
+  'export-loans': exportLoans,
   export: exportCsv,
   'lock-now': lock,
   async token() {
@@ -535,7 +785,8 @@ document.addEventListener('click', e => {
 });
 document.addEventListener('input', e => {
   if (e.target.id === 'q') { S.ui.q = e.target.value; updateHistList(); }
-  else if (e.target.id === 'f-amt') e.target.value = e.target.value.replace(/[^0-9.]/g, '').replace(/(\..*)\./g, '$1');
+  else if (e.target.id === 'l-who') refreshFull();
+  else if (e.target.id === 'f-amt' || e.target.id === 'l-amt') e.target.value = e.target.value.replace(/[^0-9.]/g, '').replace(/(\..*)\./g, '$1');
 });
 document.addEventListener('change', e => {
   if (e.target.id === 'budget') {
@@ -544,11 +795,12 @@ document.addEventListener('change', e => {
   }
 });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && F) return closeSheet();
+  if (e.key === 'Escape' && !$('#sheet').classList.contains('hidden')) return closeSheet();
   if (e.key !== 'Enter') return;
   if (e.target.id === 'pin') unlock();
   else if (e.target.id === 's-pin2') setup();
   else if (F && (e.target.id === 'f-amt' || e.target.id === 'f-note')) saveForm();
+  else if (L && ['l-who', 'l-amt', 'l-note'].includes(e.target.id)) saveLoan();
 });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { S.hiddenAt = Date.now(); persist(true); }

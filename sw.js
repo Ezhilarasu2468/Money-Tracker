@@ -1,5 +1,5 @@
 // Caches the app shell so the app opens offline. Never touches api.github.com.
-const V = 'spends-v2';
+const V = 'spends-v3';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest',
                'icons/icon-192.png', 'icons/icon-512.png'];
 
